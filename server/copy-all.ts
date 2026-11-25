@@ -15,6 +15,7 @@ import {
   jsonSafeDef,
   readJson,
   tomlString,
+  writeTargetFor,
   type McpDef,
 } from "./handlers";
 
@@ -218,7 +219,10 @@ export async function handleMcpCopyAll(
   const { servers, excluded } = planFrom(destinations);
   const plan = new Map(servers.map((entry) => [entry.name, entry]));
   const results: CopyResult[] = [];
-  const queue = new Map<string, Array<{ name: string; def: McpDef; result: CopyResult }>>();
+  // One queue per SETTINGS FILE, not per destination: accounts that share a
+  // file (the Accounts plugin's Codex homes) are written once and reported
+  // for each.
+  const queue = new Map<string, Array<{ name: string; def: McpDef; result: CopyResult; label: string }>>();
   for (const pick of chosen) {
     const entry = plan.get(pick.name);
     const result: CopyResult = { name: pick.name, from: entry?.from ?? "", written: [], skipped: [] };
@@ -232,9 +236,10 @@ export async function handleMcpCopyAll(
       const label = placeLabel(dest);
       const def = entry?.perTarget.get(id);
       if (entry && def) {
-        const list = queue.get(id) ?? [];
-        list.push({ name: pick.name, def, result });
-        queue.set(id, list);
+        const file = writeTargetFor(dest.configPath);
+        const list = queue.get(file) ?? [];
+        list.push({ name: pick.name, def, result, label });
+        queue.set(file, list);
         continue;
       }
       const blocked = entry?.blocked?.find((line) => line.label === label);
@@ -255,24 +260,32 @@ export async function handleMcpCopyAll(
     if (!entry && pick.targets.length === 0) result.skipped.push({ label: pick.name, reason: "every app already has it" });
   }
 
-  // One write per file, with one backup first, add-only; then each server is read back.
+  // One write per file, with one backup first, add-only; then each server is
+  // read back — once per physical file, whatever accounts stand over it.
+  const writtenFiles = new Set<string>();
   for (const dest of destinations) {
-    const entries = queue.get(dest.id);
+    const file = writeTargetFor(dest.configPath);
+    if (writtenFiles.has(file)) continue;
+    const entries = queue.get(file);
     if (!entries) continue;
-    const label = placeLabel(dest);
+    writtenFiles.add(file);
     let refused: Map<string, string>;
     try {
+      // Several accounts can stand over one file, so the same name can be queued
+      // for it twice: the batch writer would see the second as already there
+      // and report the first's successful write as a refusal.
+      const once = entries.filter((entry, index) => entries.findIndex((other) => other.name === entry.name) === index);
       refused = destWriteMany(
         dest,
-        entries.map(({ name, def }) => ({ name, def })),
+        once.map(({ name, def }) => ({ name, def })),
         { onlyIfAbsent: true, headerTable: dest.format === "toml-mcp" ? DIALECTS[dialectOf(dest)].headerKey : undefined },
       );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      for (const { result } of entries) result.skipped.push({ label, reason });
+      for (const { result, label } of entries) result.skipped.push({ label, reason });
       continue;
     }
-    for (const { name, def, result } of entries) {
+    for (const { name, def, result, label } of entries) {
       const reason = refused.get(name);
       if (reason) result.skipped.push({ label, reason });
       else if (readsBack(dest, name, def)) result.written.push(label);

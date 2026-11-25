@@ -22,6 +22,7 @@ import {
 import { addedToolCount, readAgentServers } from "./agent-record";
 import { readJsonCached } from "./files";
 import {
+  accountDirForDest,
   backupFile,
   buildDestinations,
   collectAccounts,
@@ -175,7 +176,7 @@ export async function handleMcpAgentServers(
   // from memory; a background refresh starts when the last answer is old).
   let account: McpAuthAccount | null = null;
   if (dest && (dest.provider === "claude" || dest.provider === "codex")) {
-    const accounts = collectAccounts({ askCodex: probe && dest.provider === "codex", only: { provider: dest.provider, email: dest.account } });
+    const accounts = collectAccounts({ askCodex: probe && dest.provider === "codex", only: { provider: dest.provider, dir: accountDirForDest(dest), email: dest.account } });
     account = accounts[0] ?? null;
   }
 

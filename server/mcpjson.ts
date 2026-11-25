@@ -31,6 +31,7 @@ import {
   writeTextAtomic,
   writeTomlChecked,
   TOML_SAFE_NAME,
+  writeTargetFor,
   type McpDef,
 } from "./handlers";
 import type { Dialect, JsonIssue, LoginSession } from "../shared/mcpjson";
@@ -570,7 +571,9 @@ function planWrites(pairs: Pair[]): Plan {
   for (const pair of pairs) {
     const dialect = dialectOf(pair.dest);
     const spec = DIALECTS[dialect];
-    const path = pair.dest.configPath;
+    // A managed account's config can be a symlink to the shared file; the
+    // document — and the write — is that file, once.
+    const path = writeTargetFor(pair.dest.configPath);
     const key = `${path}::${pair.name}`;
 
     const stored = pair.stored;
@@ -658,7 +661,10 @@ function planWrites(pairs: Pair[]): Plan {
   const commit = () => {
     const written: string[] = [];
     const failed: string[] = [];
-    const label = (path: string) => pairs.find((pair) => pair.dest.configPath === path)?.dest.label ?? path;
+    const label = (path: string) => {
+      const group = pairs.filter((pair) => writeTargetFor(pair.dest.configPath) === path);
+      return group.length === 0 ? path : group.length === 1 ? group[0].dest.label : group.map((pair) => pair.dest.label).join(", ");
+    };
     for (const [path, text] of jsonTexts) {
       try {
         backupFile(path);
@@ -671,9 +677,9 @@ function planWrites(pairs: Pair[]): Plan {
     for (const [path, document] of documents) {
       try {
         writeTomlChecked(path, tomlReadForWrite(path), document.text);
-        written.push(document.dest.label);
+        written.push(label(path));
       } catch (error) {
-        failed.push(`${document.dest.label}: ${error instanceof Error ? error.message : String(error)}`);
+        failed.push(`${label(path)}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
     return { written, failed };
@@ -779,7 +785,7 @@ export async function handleMcpRawPut(
   issues.push(...validate(resolved.entry, name, dialect, text));
 
   const plan = planWrites([{ dest, name, entry: resolved.entry, stored }]);
-  const preview = plan.previews.get(`${dest.configPath}::${name}`) ?? "";
+  const preview = plan.previews.get(`${writeTargetFor(dest.configPath)}::${name}`) ?? "";
   issues.push(...plan.issues);
 
   if (issues.length > 0) {

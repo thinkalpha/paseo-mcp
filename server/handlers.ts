@@ -1,9 +1,9 @@
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { randomBytes } from "node:crypto";
-import { copyFileSafely, writeFileSafely } from "./safe-write";
-import { chmodSync, existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSafely, isSymlink, writeFileSafely } from "./safe-write";
+import { chmodSync, existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { AuthState } from "../shared/accounts";
 import type { Destination, McpAuthAccount } from "../shared/contracts";
 import { probeMcp } from "../shared/health";
@@ -162,20 +162,86 @@ type AccountDirectory = {
   provider: "claude" | "codex";
   email: string;
   dir: string;
-  source: "agent-link" | "external";
+  source: "agent-link" | "external" | "accounts";
   loggedIn: boolean;
   actualEmail: string;
   wrongAccount: boolean;
+  /** Stable identity: the home's own name — the registry's id for a managed account. */
+  id: string;
+  /** The registry's display name for a managed account; "" where there is none. */
+  label: string;
 };
+
+// The Accounts plugin's registry (state.json), read where the plugin keeps
+// it. Its records name the homes it manages — each account's own
+// CLAUDE_CONFIG_DIR / CODEX_HOME: real per-account credential files, and for
+// Codex a settings file kept as a link into the main home (one shared
+// config, several accounts). Those homes are read, written and reported
+// under each account's own home; nothing is copied between them.
+const PASEO_ACCOUNTS = (() => {
+  const configured = process.env.PASEO_HOME?.trim();
+  return join(configured ? resolve(configured) : join(HOME, ".paseo"), "paseo-accounts");
+})();
+
+/**
+ * The Claude and Codex accounts the Accounts plugin registered, keyed by
+ * their home dir: the registry's record for it — stable id, display label,
+ * email and family. Read on every call; the registry changes as accounts are
+ * added, switched and retired. An unreadable registry means no managed
+ * accounts, not an error: the plugin simply isn't managing any here.
+ */
+type AccountRecord = { id: string; label: string; email: string; family: "claude" | "codex" };
+
+function accountsRegistry(): Map<string, AccountRecord> {
+  const registry = new Map<string, AccountRecord>();
+  const accounts = readJsonShared(join(PASEO_ACCOUNTS, "state.json"))?.accounts;
+  if (!Array.isArray(accounts)) return registry;
+  for (const entry of accounts as Array<Record<string, unknown>>) {
+    if (!entry || typeof entry !== "object") continue;
+    const home = entry.home;
+    if (typeof home !== "string" || !home) continue;
+    const id = typeof entry.id === "string" ? entry.id : "";
+    const family = entry.family === "claude" || entry.family === "codex" ? entry.family : null;
+    if (!id || !family) continue;
+    registry.set(home, {
+      id,
+      label: typeof entry.label === "string" ? entry.label : "",
+      email: typeof entry.email === "string" ? entry.email : "",
+      family,
+    });
+  }
+  return registry;
+}
+
+/**
+ * The file a write to this config goes to. Normally the config itself — a
+ * symlink included, which the writers refuse as before. One deliberate
+ * exception: a Codex account the Accounts plugin registered keeps its
+ * settings as a link to the main home's config.toml, and a write goes to that
+ * main file instead, so every account the link serves gets one answer.
+ */
+export function writeTargetFor(configPath: string): string {
+  if (basename(configPath) !== "config.toml") return configPath;
+  if (accountsRegistry().get(dirname(configPath))?.family !== "codex") return configPath;
+  if (!isSymlink(configPath)) return configPath;
+  try {
+    const target = realpathSync(configPath);
+    return resolve(target) === resolve(join(HOME, ".codex", "config.toml")) ? target : configPath;
+  } catch {
+    return configPath;
+  }
+}
 
 function collectSlots(): AccountDirectory[] {
   const slots: AccountDirectory[] = [];
   const seen = new Set<string>();
-  const add = (provider: "claude" | "codex", dir: string, source: "agent-link" | "external") => {
+  const add = (provider: "claude" | "codex", dir: string, source: "agent-link" | "external" | "accounts", registered?: AccountRecord) => {
     if (seen.has(dir)) return;
     seen.add(dir);
-    const email = basename(dir);
     const actualEmail = provider === "claude" ? claudeAccountEmail(dir) : codexAccountEmail(dir);
+    // A legacy slot's name IS its email. A managed home's name is its registry
+    // id; its email is what its own credential file says, or the registry's.
+    const email = source === "accounts" ? actualEmail || (registered?.email ?? "") : basename(dir);
     const loggedIn = slotLoggedIn(provider, dir, actualEmail);
     slots.push({
       provider,
@@ -184,7 +250,11 @@ function collectSlots(): AccountDirectory[] {
       source,
       loggedIn,
       actualEmail,
-      wrongAccount: loggedIn && actualEmail !== "" && actualEmail !== email,
+      // Only a legacy slot names its directory after an email, so only there
+      // can the login and the name disagree.
+      wrongAccount: source !== "accounts" && loggedIn && actualEmail !== "" && actualEmail !== email,
+      id: registered?.id ?? basename(dir),
+      label: registered?.label ?? "",
     });
   };
   for (const provider of ["claude", "codex"] as const) {
@@ -192,6 +262,11 @@ function collectSlots(): AccountDirectory[] {
   }
   for (const { provider, root } of EXTERNAL_ROOTS) {
     for (const dir of listDirs(root)) add(provider, dir, "external");
+  }
+  // The Accounts plugin's managed accounts, straight from its registry.
+  for (const [home, record] of accountsRegistry()) {
+    if (!existsSync(home)) continue;
+    add(record.family, home, "accounts", record);
   }
   return slots;
 }
@@ -778,13 +853,17 @@ export function destNamesAll(dest: Destination): Set<string> {
 }
 
 export function destWrite(dest: Destination, name: string, def: McpDef | null, options: WriteOptions = {}): void {
-  if (dest.format === "json-mcp") jsonMcpWrite(dest.configPath, name, def, options);
-  else tomlMcpWrite(dest.configPath, name, def, options);
+  // A managed account's config can be a symlink to the shared file: the write
+  // goes to that file, with that file's stamp and backup.
+  const path = writeTargetFor(dest.configPath);
+  if (dest.format === "json-mcp") jsonMcpWrite(path, name, def, options);
+  else tomlMcpWrite(path, name, def, options);
 }
 
 /** Several servers into one destination in one write, with one backup first. Returns the refusals by name. */
 export function destWriteMany(dest: Destination, entries: Array<{ name: string; def: McpDef }>, options: WriteOptions = {}): Map<string, string> {
-  return dest.format === "json-mcp" ? jsonMcpWriteMany(dest.configPath, entries, options) : tomlMcpWriteMany(dest.configPath, entries, options);
+  const path = writeTargetFor(dest.configPath);
+  return dest.format === "json-mcp" ? jsonMcpWriteMany(path, entries, options) : tomlMcpWriteMany(path, entries, options);
 }
 
 // ---------------------------------------------------------------- destinations
@@ -876,9 +955,13 @@ export async function buildDestinations(paseo: PluginHandlerContext["paseo"] | n
   // Slots that exist but are not wired as providers yet.
   for (const slot of collectSlots()) {
     const configPath = slot.provider === "claude" ? join(slot.dir, ".claude.json") : join(slot.dir, "config.toml");
+    const who = slot.source === "accounts" ? slot.label || slot.email || slot.id : slot.email;
+    // A managed Codex account's settings live in the main home's file: say so
+    // on the row, before anything is written there.
+    const shared = writeTargetFor(configPath) !== configPath;
     push({
       id: configPath,
-      label: `${slot.provider === "claude" ? "Claude" : "Codex"} · ${slot.email} (slot)`,
+      label: `${slot.provider === "claude" ? "Claude" : "Codex"} · ${who} (${slot.source === "accounts" ? (shared ? "Accounts, shared config" : "Accounts") : "slot"})`,
       provider: slot.provider,
       providerId: "",
       account: slot.email,
@@ -887,6 +970,14 @@ export async function buildDestinations(paseo: PluginHandlerContext["paseo"] | n
     });
   }
   return destinations;
+}
+
+/** The CLI home a destination stands for — the account dir `collectAccounts` matches on. */
+export function accountDirForDest(dest: Pick<Destination, "provider" | "configPath">): string {
+  // The primary Claude config sits beside the home's other files; its home
+  // is still ~/.claude.
+  if (dest.provider === "claude" && resolve(dest.configPath) === resolve(join(HOME, ".claude.json"))) return join(HOME, ".claude");
+  return dirname(dest.configPath);
 }
 
 // ---------------------------------------------------------------- handlers
@@ -949,17 +1040,26 @@ export function applyDefToTargets(
 ): { written: string[]; skipped: string[] } {
   const written: string[] = [];
   const skipped: string[] = [];
+  // Two accounts can stand over one settings file (the Accounts plugin's
+  // Codex homes share the main home's config): one write to that file, one
+  // backup, one answer reported for every account it serves.
+  const byFile = new Map<string, Destination[]>();
   for (const target of targets) {
     const dest = destinations.find((candidate) => candidate.id === target);
     if (!dest) {
       skipped.push(`${target}: unknown destination`);
       continue;
     }
+    const file = writeTargetFor(dest.configPath);
+    byFile.set(file, [...(byFile.get(file) ?? []), dest]);
+  }
+  for (const group of byFile.values()) {
     try {
-      destWrite(dest, name, def);
-      written.push(dest.label);
+      destWrite(group[0], name, def);
+      for (const dest of group) written.push(dest.label);
     } catch (error) {
-      skipped.push(`${dest.label}: ${error instanceof Error ? error.message : String(error)}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      for (const dest of group) skipped.push(`${dest.label}: ${reason}`);
     }
   }
   return { written, skipped };
@@ -1243,19 +1343,28 @@ export async function handleMcpRename({ name, newName }: { name: string; newName
   const destinations = await buildDestinations(paseo, { fresh: true });
   const renamed: string[] = [];
   const skipped: string[] = [];
+  // One rename per settings file: accounts sharing a file (the Accounts
+  // plugin's Codex homes) rename once, and the answer is reported for each.
+  const byFile = new Map<string, Destination[]>();
   for (const dest of destinations) {
+    const file = writeTargetFor(dest.configPath);
+    byFile.set(file, [...(byFile.get(file) ?? []), dest]);
+  }
+  for (const group of byFile.values()) {
+    const dest = group[0];
     const def = destReadOne(dest, name);
     if (!def) continue;
     if (destReadOne(dest, newName)) {
-      skipped.push(`${dest.label}: '${newName}' already exists there`);
+      for (const member of group) skipped.push(`${member.label}: '${newName}' already exists there`);
       continue;
     }
     try {
       destWrite(dest, newName, def); // write the copy first, then remove the old —
       destWrite(dest, name, null); //   a failure in between leaves both, never neither
-      renamed.push(dest.label);
+      for (const member of group) renamed.push(member.label);
     } catch (error) {
-      skipped.push(`${dest.label}: ${error instanceof Error ? error.message : String(error)}`);
+      const reason = error instanceof Error ? error.message : String(error);
+      for (const member of group) skipped.push(`${member.label}: ${reason}`);
     }
   }
   if (renamed.length === 0) return { ok: false, message: ["nothing renamed", ...skipped].join("\n") };
@@ -1328,8 +1437,8 @@ export type AccountOptions = {
   askCodex: boolean;
   /** Ask Codex again now, whatever the cache says (Refresh, a finished sign-in). */
   force?: boolean;
-  /** Only this account (the agent panel needs one). */
-  only?: { provider: string; email: string };
+  /** Only this account (the agent panel needs one). By home dir when known — labels and emails can repeat, a home dir never does. */
+  only?: { provider: string; dir?: string; email?: string };
 };
 
 /**
@@ -1340,8 +1449,12 @@ export type AccountOptions = {
  * from a background check. No process is started on this path.
  */
 export function collectAccounts(options: AccountOptions): McpAuthAccount[] {
-  const wanted = (provider: string, email: string) =>
-    !options.only || (options.only.provider === provider && options.only.email === email);
+  const wanted = (provider: string, email: string, dir: string) => {
+    const only = options.only;
+    if (!only) return true;
+    if (only.provider !== provider) return false;
+    return only.dir ? only.dir === dir : only.email === email;
+  };
   const readNeeds = (dir: string): string[] => {
     const data = readJsonShared(join(dir, "mcp-needs-auth-cache.json"));
     return data ? Object.keys(data) : [];
@@ -1378,17 +1491,17 @@ export function collectAccounts(options: AccountOptions): McpAuthAccount[] {
   const accounts: McpAuthAccount[] = [];
   const slots = collectSlots();
   const primaryEmail = claudeAccountEmail(HOME);
-  if (primaryEmail && wanted("claude", primaryEmail)) accounts.push(claude(primaryEmail, join(HOME, ".claude"), join(HOME, ".claude.json"), true));
+  if (primaryEmail && wanted("claude", primaryEmail, join(HOME, ".claude"))) accounts.push(claude(primaryEmail, join(HOME, ".claude"), join(HOME, ".claude.json"), true));
   for (const slot of slots) {
-    if (slot.provider === "claude" && wanted("claude", slot.email)) accounts.push(claude(slot.email, slot.dir, join(slot.dir, ".claude.json"), false));
+    if (slot.provider === "claude" && wanted("claude", slot.email, slot.dir)) accounts.push(claude(slot.email, slot.dir, join(slot.dir, ".claude.json"), false));
   }
   const primaryCodexDir = join(HOME, ".codex");
   const primaryCodexEmail = codexAccountEmail(primaryCodexDir);
-  if (primaryCodexEmail && wanted("codex", primaryCodexEmail)) accounts.push(codex(primaryCodexEmail, primaryCodexDir, true));
+  if (primaryCodexEmail && wanted("codex", primaryCodexEmail, primaryCodexDir)) accounts.push(codex(primaryCodexEmail, primaryCodexDir, true));
   for (const slot of slots) {
     // The destination is keyed by the slot name. The Agents tab separately
     // flags a slot whose authenticated email does not match that name.
-    if (slot.provider === "codex" && slot.loggedIn && wanted("codex", slot.email)) accounts.push(codex(slot.email, slot.dir, false));
+    if (slot.provider === "codex" && slot.loggedIn && wanted("codex", slot.email, slot.dir)) accounts.push(codex(slot.email, slot.dir, false));
   }
   return accounts;
 }
@@ -1493,7 +1606,7 @@ export async function handleMcpSync(): Promise<{ ok: boolean; log: string }> {
       else if (def) primaryDefs.push([name, def]);
     }
     for (const slot of slots.filter((entry) => entry.provider === "codex")) {
-      const path = join(slot.dir, "config.toml");
+      const path = writeTargetFor(join(slot.dir, "config.toml"));
       try {
         const before = tomlReadForWrite(path);
         let text = before;
